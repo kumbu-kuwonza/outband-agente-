@@ -1,72 +1,87 @@
-<a href="https://livekit.io/">
-  <img src="./.github/assets/livekit-mark.png" alt="LiveKit logo" width="100" height="100">
-</a>
+# Outbound Prospector Agent
 
-# Python Outbound Call Agent
-
-<p>
-  <a href="https://docs.livekit.io/agents/overview/">LiveKit Agents Docs</a>
-  •
-  <a href="https://livekit.io/cloud">LiveKit Cloud</a>
-  •
-  <a href="https://blog.livekit.io/">Blog</a>
-</p>
-
-This example demonstrates an full workflow of an AI agent that makes outbound calls. It uses LiveKit SIP and Python [Agents Framework](https://github.com/livekit/agents).
-
-It can use a pipeline of STT, LLM, and TTS models, or a realtime speech-to-speech model. (such as ones from OpenAI and Gemini).
-
-This example builds on concepts from the [Outbound Calls](https://docs.livekit.io/agents/start/telephony/#outbound-calls) section of the docs. Ensure that a SIP outbound trunk is configured before proceeding.
+AI agent for automated outbound prospecting calls using LiveKit, Twilio SIP, Google Sheets, and n8n.
 
 ## Features
 
-This example demonstrates the following features:
+- Reads contacts from Google Sheets
+- Makes outbound calls via LiveKit + Twilio SIP trunk
+- Uses LLM (OpenAI-compatible) for natural conversation
+- Detects voicemail and handles gracefully
+- Verifies decision maker status
+- Attempts appointment scheduling
+- Sends structured call summaries to n8n webhook
+- Updates Google Sheets with call results
+- Supports batch campaign mode
 
-- Making outbound calls
-- Detecting voicemail
-- Looking up availability via function calling
-- Transferring to a human operator
-- Detecting intent to end the call
-- Uses Krisp background voice cancellation to handle noisy environments
+## Prerequisites
 
-## Dev Setup
+- LiveKit server (self-hosted or cloud)
+- Twilio account with SIP trunk configured
+- Google Sheets API credentials (service account)
+- n8n instance with webhook endpoint
+- Deepgram API key (STT)
+- Cartesia API key (TTS)
+- OpenAI-compatible API key (LLM)
 
-Clone the repository and install dependencies to a virtual environment:
+## Setup
 
-```shell
-git clone https://github.com/livekit-examples/outbound-caller-python.git
+1. Clone and install:
+```bash
+git clone <repo-url>
 cd outbound-caller-python
-python3 -m venv venv
-source venv/bin/activate
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# or: venv\Scripts\Activate.ps1  # Windows
 pip install -r requirements.txt
 python agent.py download-files
 ```
 
-Set up the environment by copying `.env.example` to `.env.local` and filling in the required values:
+2. Copy `.env.example` to `.env.local` and fill in your credentials.
 
-- `LIVEKIT_URL`
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
-- `OPENAI_API_KEY`
-- `SIP_OUTBOUND_TRUNK_ID`
-- `DEEPGRAM_API_KEY` - optional, only needed when using pipelined models
-- `CARTESIA_API_KEY` - optional, only needed when using pipelined models
+3. Prepare Google Sheets:
+   - Create a spreadsheet with columns: `Nome`, `Telefone`, `Pais`, `Contexto`
+   - Share it with the service account email from your credentials.json
+   - Optional columns: any extra columns will be stored as context
 
-Run the agent:
+4. Create n8n webhook:
+   - Add a webhook node in n8n
+   - Set the URL in `N8N_WEBHOOK_URL`
+   - Payload: `{ is_decisor, decisor_name, decisor_phone, appointment_date, contact_person_name, notes, call_outcome, contact_row_index }`
 
-```shell
-python3 agent.py dev
+## Running
+
+### As a worker (receives dispatches):
+```bash
+python agent.py dev
 ```
 
-Now, your worker is running, and waiting for dispatches in order to make outbound calls.
+### Run campaign mode (reads sheets and dials sequentially):
+```bash
+python agent.py campaign
+```
 
-### Making a call
-
-You can dispatch an agent to make a call by using the `lk` CLI:
-
-```shell
+### Dispatch a single call:
+```bash
 lk dispatch create \
   --new-room \
   --agent-name outbound-caller \
-  --metadata '{"phone_number": "+1234567890", "transfer_to": "+9876543210"}'
+  --metadata '{"phone_number": "+5511999999999", "contact_name": "João", "country": "BR", "business_context": "Restaurante", "row_index": 2}'
 ```
+
+## Google Sheets Format
+
+| Nome | Telefone | Pais | Contexto |
+|------|----------|------|----------|
+| João Silva | +5511999999999 | BR | Dono de restaurante, interessado em delivery |
+| Maria Santos | +351912345678 | PT | Gerente de loja, precisa de solução de marketing |
+
+## Environment Variables
+
+See `.env.example` for the full list. Key variables:
+
+- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` — LiveKit connection
+- `SIP_OUTBOUND_TRUNK_ID` — SIP trunk for outbound calls
+- `GOOGLE_SHEETS_CREDENTIALS_FILE`, `GOOGLE_SHEETS_SPREADSHEET_ID` — Contact source
+- `N8N_WEBHOOK_URL` — Where to send call summaries
+- `OPENAI_API_KEY`, `OPENAI_MODEL` — LLM provider

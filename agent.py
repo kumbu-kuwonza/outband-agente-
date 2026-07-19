@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-from dotenv import load_dotenv
 import json
+import logging
 import os
 from typing import Any
 
+from dotenv import load_dotenv
 from livekit import rtc, api
 from livekit.agents import (
     AgentSession,
@@ -24,12 +24,22 @@ from livekit.plugins import (
     openai,
     cartesia,
     silero,
-    noise_cancellation,  # noqa: F401
+    noise_cancellation,
 )
+
+# NOTE: EnglishModel is used for turn detection. For Portuguese calls (BR/PT),
+# this could be swapped when LiveKit adds a Portuguese turn detector.
 from livekit.plugins.turn_detector.english import EnglishModel
 
+# Configurable turn detection model. Currently English-only.
+# For Portuguese calls, swap this when LiveKit adds a Portuguese turn detector.
+turn_detection_model = EnglishModel
 
-# load environment variables, this is optional, only used for local development
+from contacts import Contact
+from integrations import CallSummary, send_summary_to_n8n
+from prompts import get_prospecting_prompt
+from campaign import run_campaign
+
 load_dotenv(dotenv_path=".env.local")
 logger = logging.getLogger("outbound-caller")
 logger.setLevel(logging.INFO)
@@ -37,81 +47,74 @@ logger.setLevel(logging.INFO)
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
 
 
-class OutboundCaller(Agent):
+class ProspectingAgent(Agent):
     def __init__(
         self,
         *,
-        name: str,
-        appointment_time: str,
-        dial_info: dict[str, Any],
+        contact: Contact,
+        agent_name: str = "Consultor",
+        company_name: str = "MEC Burguer",
     ):
-        super().__init__(
-            instructions=f"""
-            You are a scheduling assistant for a dental practice. Your interface with user will be voice.
-            You will be on a call with a patient who has an upcoming appointment. Your goal is to confirm the appointment details.
-            As a customer service representative, you will be polite and professional at all times. Allow user to end the conversation.
-
-            When the user would like to be transferred to a human agent, first confirm with them. upon confirmation, use the transfer_call tool.
-            The customer's name is {name}. His appointment is on {appointment_time}.
-            """
+        prompt = get_prospecting_prompt(
+            agent_name=agent_name,
+            company_name=company_name,
+            contact_name=contact.name,
+            business_context=contact.business_context,
+            country=contact.country,
         )
-        # keep reference to the participant for transfers
+        super().__init__(instructions=prompt)
+        self.contact = contact
         self.participant: rtc.RemoteParticipant | None = None
-
-        self.dial_info = dial_info
+        self.call_summary: CallSummary | None = None
 
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
 
     async def hangup(self):
-        """Helper function to hang up the call by deleting the room"""
-
         job_ctx = get_job_context()
         await job_ctx.api.room.delete_room(
-            api.DeleteRoomRequest(
-                room=job_ctx.room.name,
-            )
+            api.DeleteRoomRequest(room=job_ctx.room.name)
         )
 
     @function_tool()
-    async def transfer_call(self, ctx: RunContext):
-        """Transfer the call to a human agent, called after confirming with the user"""
+    async def end_call(
+        self,
+        ctx: RunContext,
+        is_decisor: bool,
+        decisor_name: str,
+        decisor_phone: str,
+        appointment_date: str,
+        contact_person_name: str,
+        notes: str,
+        call_outcome: str,
+    ):
+        """Finalize a prospection call with a structured summary.
 
-        transfer_to = self.dial_info["transfer_to"]
-        if not transfer_to:
-            return "cannot transfer call"
-
-        logger.info(f"transferring call to {transfer_to}")
-
-        # let the message play fully before transferring
-        await ctx.session.generate_reply(
-            instructions="let the user know you'll be transferring them"
+        Args:
+            is_decisor: Whether the contact was the decision maker
+            decisor_name: Name of the decision maker if identified
+            decisor_phone: Phone of the decision maker if collected
+            appointment_date: Scheduled appointment date/time if any
+            contact_person_name: Name of the person who answered
+            notes: Important observations from the conversation
+            call_outcome: One of: agendado, interessado, nao_interessado, nao_decisor, recusou_contato, nao_atendeu
+        """
+        self.call_summary = CallSummary(
+            is_decisor=is_decisor,
+            decisor_name=decisor_name,
+            decisor_phone=decisor_phone,
+            appointment_date=appointment_date,
+            contact_person_name=contact_person_name,
+            notes=notes,
+            contact_row_index=self.contact.row_index,
+            call_outcome=call_outcome,
         )
 
-        job_ctx = get_job_context()
-        try:
-            await job_ctx.api.sip.transfer_sip_participant(
-                api.TransferSIPParticipantRequest(
-                    room_name=job_ctx.room.name,
-                    participant_identity=self.participant.identity,
-                    transfer_to=f"tel:{transfer_to}",
-                )
-            )
+        logger.info(
+            f"Call ended for {self.contact.name}: outcome={call_outcome}, "
+            f"is_decisor={is_decisor}, appointment={appointment_date}"
+        )
 
-            logger.info(f"transferred call to {transfer_to}")
-        except Exception as e:
-            logger.error(f"error transferring call: {e}")
-            await ctx.session.generate_reply(
-                instructions="there was an error transferring the call."
-            )
-            await self.hangup()
-
-    @function_tool()
-    async def end_call(self, ctx: RunContext):
-        """Called when the user wants to end the call"""
-        logger.info(f"ending the call for {self.participant.identity}")
-
-        # let the agent finish speaking
         current_speech = ctx.session.current_speech
         if current_speech:
             await current_speech.wait_for_playout()
@@ -119,126 +122,104 @@ class OutboundCaller(Agent):
         await self.hangup()
 
     @function_tool()
-    async def look_up_availability(
-        self,
-        ctx: RunContext,
-        date: str,
-    ):
-        """Called when the user asks about alternative appointment availability
-
-        Args:
-            date: The date of the appointment to check availability for
-        """
-        logger.info(
-            f"looking up availability for {self.participant.identity} on {date}"
-        )
-        await asyncio.sleep(3)
-        return {
-            "available_times": ["1pm", "2pm", "3pm"],
-        }
-
-    @function_tool()
-    async def confirm_appointment(
-        self,
-        ctx: RunContext,
-        date: str,
-        time: str,
-    ):
-        """Called when the user confirms their appointment on a specific date.
-        Use this tool only when they are certain about the date and time.
-
-        Args:
-            date: The date of the appointment
-            time: The time of the appointment
-        """
-        logger.info(
-            f"confirming appointment for {self.participant.identity} on {date} at {time}"
-        )
-        return "reservation confirmed"
-
-    @function_tool()
     async def detected_answering_machine(self, ctx: RunContext):
-        """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting"""
-        logger.info(f"detected answering machine for {self.participant.identity}")
+        """Called when the call reaches voicemail. Hang up immediately."""
+        logger.info(f"Voicemail detected for {self.contact.name}")
+        self.call_summary = CallSummary(
+            is_decisor=False,
+            decisor_name="",
+            decisor_phone="",
+            appointment_date="",
+            contact_person_name="",
+            notes="Caixa de correio detectado",
+            contact_row_index=self.contact.row_index,
+            call_outcome="nao_atendeu",
+        )
         await self.hangup()
 
 
 async def entrypoint(ctx: JobContext):
-    logger.info(f"connecting to room {ctx.room.name}")
+    logger.info(f"Connecting to room {ctx.room.name}")
     await ctx.connect()
 
-    # when dispatching the agent, we'll pass it the approriate info to dial the user
-    # dial_info is a dict with the following keys:
-    # - phone_number: the phone number to dial
-    # - transfer_to: the phone number to transfer the call to when requested
     dial_info = json.loads(ctx.job.metadata)
-    participant_identity = phone_number = dial_info["phone_number"]
+    participant_identity = dial_info["phone_number"]
 
-    # look up the user's phone number and appointment details
-    agent = OutboundCaller(
-        name="Jayden",
-        appointment_time="next Tuesday at 3pm",
-        dial_info=dial_info,
+    contact = Contact(
+        row_index=dial_info.get("row_index", 0),
+        name=dial_info.get("contact_name", "Contato"),
+        phone=dial_info["phone_number"],
+        country=dial_info.get("country", "BR"),
+        business_context=dial_info.get("business_context", ""),
+        extra={},
     )
 
-    # the following uses GPT-4o, Deepgram and Cartesia
+    agent = ProspectingAgent(
+        contact=contact,
+        agent_name=os.environ.get("AGENT_NAME", "Consultor"),
+        company_name=os.environ.get("COMPANY_NAME", "MEC Burguer"),
+    )
+
     session = AgentSession(
-        turn_detection=EnglishModel(),
+        turn_detection=turn_detection_model(),
         vad=silero.VAD.load(),
         stt=deepgram.STT(),
-        # you can also use OpenAI's TTS with openai.TTS()
         tts=cartesia.TTS(),
-        llm=openai.LLM(model="gpt-4o"),
-        # you can also use a speech-to-speech model like OpenAI's Realtime API
-        # llm=openai.realtime.RealtimeModel()
+        llm=openai.LLM(
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            base_url=os.environ.get("OPENAI_BASE_URL"),
+        ),
     )
 
-    # start the session first before dialing, to ensure that when the user picks up
-    # the agent does not miss anything the user says
     session_started = asyncio.create_task(
         session.start(
             agent=agent,
             room=ctx.room,
             room_input_options=RoomInputOptions(
-                # enable Krisp background voice and noise removal
                 noise_cancellation=noise_cancellation.BVCTelephony(),
             ),
         )
     )
 
-    # `create_sip_participant` starts dialing the user
     try:
         await ctx.api.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(
                 room_name=ctx.room.name,
                 sip_trunk_id=outbound_trunk_id,
-                sip_call_to=phone_number,
+                sip_call_to=participant_identity,
                 participant_identity=participant_identity,
-                # function blocks until user answers the call, or if the call fails
                 wait_until_answered=True,
             )
         )
 
-        # wait for the agent session start and participant join
         await session_started
         participant = await ctx.wait_for_participant(identity=participant_identity)
-        logger.info(f"participant joined: {participant.identity}")
+        logger.info(f"Participant joined: {participant.identity}")
 
         agent.set_participant(participant)
 
     except api.TwirpError as e:
         logger.error(
-            f"error creating SIP participant: {e.message}, "
+            f"Error creating SIP participant: {e.message}, "
             f"SIP status: {e.metadata.get('sip_status_code')} "
             f"{e.metadata.get('sip_status')}"
         )
         ctx.shutdown()
 
 
+async def run_campaign_entrypoint():
+    await run_campaign()
+
+
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="outbound-caller",
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "campaign":
+        asyncio.run(run_campaign_entrypoint())
+    else:
+        cli.run_app(
+            WorkerOptions(
+                entrypoint_fnc=entrypoint,
+                agent_name="outbound-caller",
+            )
         )
-    )
