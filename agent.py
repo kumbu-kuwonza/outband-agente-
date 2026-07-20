@@ -166,8 +166,9 @@ async def entrypoint(ctx: JobContext):
         stt=deepgram.STT(),
         tts=cartesia.TTS(),
         llm=openai.LLM(
-            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-            base_url=os.environ.get("OPENAI_BASE_URL"),
+            model=os.environ.get("OLLAMA_MODEL", "llama3.1"),
+            base_url=os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1"),
+            api_key=os.environ.get("OLLAMA_API_KEY", ""),
         ),
     )
 
